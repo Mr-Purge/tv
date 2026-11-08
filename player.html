@@ -131,6 +131,7 @@ function seekTo(t){try{if(media&&isFinite(media.duration)&&Math.abs(media.curren
 addEventListener('message',e=>{
   let d=e.data;if(typeof d==='string'){try{d=JSON.parse(d)}catch(x){return}}
   if(!d||!d.action)return;
+  if(d.action==='dot'){const o=document.createElement('div');o.style.cssText='position:fixed;z-index:99999;pointer-events:none;width:26px;height:26px;margin:-13px 0 0 -13px;border-radius:50%;background:rgba(255,0,0,.75);border:2px solid #fff;left:'+d.x+'px;top:'+d.y+'px';document.body.appendChild(o);setTimeout(()=>o.remove(),2500);return}
   if(d.action==='volume')setVol(d.v);
   else if(d.action==='pause'){paused=true;try{if(media)media.pause();if(yt&&yt.pauseVideo)yt.pauseVideo();if(tw)tw.pause()}catch(x){}}
   else if(d.action==='resume'){paused=false;if(d.t!=null)seekTo(d.t);try{if(media)media.play();if(yt&&yt.playVideo)yt.playVideo();if(tw)tw.play()}catch(x){}}
