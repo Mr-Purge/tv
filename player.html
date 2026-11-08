@@ -1,0 +1,147 @@
+<!doctype html><html><head><meta charset="utf-8"><title>Purge TV Player</title>
+<style>
+html,body{margin:0;width:100%;height:100%;background:#000;overflow:hidden;font-family:Arial,sans-serif;color:#fff}
+#root,video,img,iframe,#yt,#tw{position:absolute;inset:0;width:100%;height:100%;border:0}
+video{object-fit:contain;background:#000}img{object-fit:contain;background:#000}
+#msg{position:absolute;left:0;right:0;bottom:4%;text-align:center;font-size:3.2vh;color:#ff8fa8;text-shadow:0 0 6px #000;z-index:9}
+#aud{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;background:radial-gradient(circle,#2a2145,#0b0813);font-size:9vh;font-weight:700;letter-spacing:.2em}
+#aud b{color:#e11d48}#aud small{font-size:3vh;letter-spacing:.1em;color:#8d84a8;margin-top:2vh}
+</style></head><body>
+<div id="root"></div><div id="msg"></div><div id="diag" style="display:none;position:absolute;left:0;right:0;top:0;z-index:9;background:#000c;color:#ffd0d8;font-size:2.6vh;padding:1vh 1.5vw"></div>
+<script src="https://cdn.jsdelivr.net/npm/hls.js@1.5.17/dist/hls.min.js"></script>
+<script>
+const Q=new URLSearchParams(location.search);
+const kind=Q.get('kind'),vid=Q.get('id'),src=Q.get('src');
+let vol=+Q.get('vol')||0,startT=+Q.get('t')||0,paused=Q.get('paused')==='1';
+const seq=+Q.get('seq')||0,res=Q.get('res')||'Purge_tv';
+const pipeds=(Q.get('piped')||'').split(',').filter(Boolean);
+let serverCands=[];try{serverCands=JSON.parse(Q.get('cands')||'[]')}catch(e){}
+const merr=Q.get('merr')||'';
+const root=document.getElementById('root'),msg=document.getElementById('msg');
+let media=null,yt=null,tw=null,ended=false;
+const say=t=>{msg.textContent=t||''};
+function reportEnded(){if(ended)return;ended=true;try{fetch('https://'+res+'/playerEnded',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({seq})})}catch(e){}}
+let hlsInst=null;
+// Laedt eine Quelle in ein Medien-Element; liefert true, sobald Bild/Ton laufen, sonst false (mit Fehlertext in lastErr)
+let lastErr='';
+function loadInto(el,url,isHls){
+  return new Promise(res=>{
+    let done=false;const fin=(ok,why)=>{if(done)return;done=true;clearTimeout(to);if(!ok)lastErr=why||'unbekannt';res(ok)};
+    const to=setTimeout(()=>fin(false,'Zeitüberschreitung (12 s)'),12000);
+    el.onerror=()=>fin(false,'Medienfehler '+(el.error?el.error.code+' '+(el.error.message||''):''));
+    el.addEventListener('loadeddata',()=>fin(true),{once:true});
+    el.addEventListener('playing',()=>fin(true),{once:true});
+    if(hlsInst){try{hlsInst.destroy()}catch(e){}hlsInst=null}
+    if(isHls&&window.Hls&&Hls.isSupported()){
+      const h=new Hls({maxBufferLength:20,manifestLoadingMaxRetry:1,levelLoadingMaxRetry:1,fragLoadingMaxRetry:2});hlsInst=h;
+      h.loadSource(url);h.attachMedia(el);
+      h.on(Hls.Events.ERROR,(e,d)=>{
+        if(!d.fatal)return;
+        if(done&&d.type===Hls.ErrorTypes.NETWORK_ERROR){try{h.startLoad()}catch(x){}return}
+        if(done&&d.type===Hls.ErrorTypes.MEDIA_ERROR){try{h.recoverMediaError()}catch(x){}return}
+        fin(false,'HLS '+d.type+' / '+d.details+(d.response&&d.response.code?' (HTTP '+d.response.code+')':''));
+      });
+    }else if(isHls&&!window.Hls){fin(false,'hls.js nicht geladen (kein Internet / CDN blockiert)')}
+    else el.src=url;
+    const p=el.play();if(p&&p.catch)p.catch(()=>{el.muted=true;el.play().catch(()=>{})});
+  });
+}
+function prepare(el){
+  media=el;el.autoplay=true;el.playsInline=true;el.volume=Math.max(0,Math.min(1,vol/100));
+  el.addEventListener('ended',reportEnded);
+  el.addEventListener('loadedmetadata',()=>{if(startT>=1&&isFinite(el.duration))try{el.currentTime=Math.min(startT,el.duration-1)}catch(e){}},{once:true});
+}
+async function attachMedia(el,url,isHls){
+  prepare(el);
+  const ok=await loadInto(el,url,isHls);
+  if(!ok)say('Stream konnte nicht geladen werden: '+lastErr);
+  else if(paused)el.pause();
+  return ok;
+}
+function video(url){const v=document.createElement('video');root.appendChild(v);return attachMedia(v,url,/\.m3u8(\?|$)/i.test(url))}
+function audio(url){
+  root.innerHTML='<div id="aud">PURGE&nbsp;<b>TV</b><small>♪ Audio</small></div>';
+  const a=document.createElement('audio');root.appendChild(a);return attachMedia(a,url,false);
+}
+function image(url){const i=document.createElement('img');i.src=url;i.onerror=()=>say('Bild konnte nicht geladen werden');root.appendChild(i)}
+
+// ---- YouTube: Piped (mehrere Kandidaten: HLS, dann fertige MP4), zuletzt Einbettung ----
+async function pipedCandidates(id){
+  const list=[];
+  for(const base of pipeds){
+    try{
+      const c=new AbortController();const to=setTimeout(()=>c.abort(),8000);
+      const r=await fetch(base.replace(/\/$/,'')+'/streams/'+id,{signal:c.signal});clearTimeout(to);
+      if(!r.ok){lastErr='Piped '+base+' HTTP '+r.status;continue}
+      const j=await r.json();
+      if(j.hls)list.push({url:j.hls,hls:true,from:base});
+      const vs=(j.videoStreams||[]).filter(s=>!s.videoOnly&&/mp4/i.test(s.mimeType||s.format||''));
+      vs.sort((a,b)=>(b.height||0)-(a.height||0));
+      const pick=vs.find(s=>(s.height||0)<=720)||vs[vs.length-1];
+      if(pick)list.push({url:pick.url,hls:false,from:base});
+    }catch(e){lastErr='Piped '+base+': '+(e.name==='AbortError'?'Zeitüberschreitung':e.message)}
+  }
+  return list;
+}
+function ytEmbed(id){
+  say('');
+  const s=document.createElement('script');s.src='https://www.youtube.com/iframe_api';document.head.appendChild(s);
+  const d=document.createElement('div');d.id='yt';root.appendChild(d);
+  window.onYouTubeIframeAPIReady=()=>{
+    yt=new YT.Player('yt',{videoId:id,width:'100%',height:'100%',playerVars:Object.assign({autoplay:1,controls:0,modestbranding:1,rel:0,start:startT,playsinline:1},/^https?:/.test(location.origin)?{origin:location.origin}:{}),
+      events:{onReady:e=>{e.target.setVolume(vol);if(paused)e.target.pauseVideo();else e.target.playVideo()},
+              onStateChange:e=>{if(e.data===0)reportEnded()},
+              onError:e=>say('YouTube-Video nicht verfügbar oder blockiert (Code '+e.data+'). Piped: '+lastErr)}});
+  };
+}
+function banner(t){const b=document.getElementById('diag');if(b){b.textContent=t;b.style.display=t?'block':'none'}}
+async function youtube(id){
+  // 1) vom Server aufgeloeste Adressen, 2) im Player selbst bei Piped nachfragen
+  let cands=serverCands.map(c=>({url:c.u,hls:!!c.h,from:'server'}));
+  if(!cands.length)cands=await pipedCandidates(id);
+  for(const c of cands){
+    root.innerHTML='';media=null;
+    const v=document.createElement('video');root.appendChild(v);prepare(v);
+    if(await loadInto(v,c.url,c.hls)){if(paused)v.pause();say('');return}
+    say('Quelle fehlgeschlagen ('+lastErr+'), versuche nächste …');
+  }
+  root.innerHTML='';media=null;
+  ytEmbed(id);
+  banner('Piped nicht verfügbar → YouTube-Einbettung. '+(merr||lastErr||'')+' (Bei Fehler 153: Config.PlayerBaseUrl setzen oder Piped reparieren)');
+  setTimeout(()=>banner(''),20000);
+}
+// ---- Twitch ----
+function twitch(opts){
+  const s=document.createElement('script');s.src='https://player.twitch.tv/js/embed/v1.js';
+  s.onload=()=>{
+    const d=document.createElement('div');d.id='tw';root.appendChild(d);
+    const parent=['localhost','nui-game-internal',location.hostname||'localhost','cfx-nui-'+res];
+    tw=new Twitch.Player('tw',Object.assign({width:'100%',height:'100%',autoplay:true,parent},opts));
+    tw.addEventListener(Twitch.Player.READY,()=>{tw.setVolume(Math.max(0,Math.min(1,vol/100)));if(paused)tw.pause()});
+    tw.addEventListener(Twitch.Player.ENDED,reportEnded);
+  };
+  s.onerror=()=>say('Twitch konnte nicht geladen werden');
+  document.head.appendChild(s);
+}
+
+// ---- Steuerung von Lua ----
+function setVol(v){vol=v;try{if(media)media.volume=Math.max(0,Math.min(1,v/100));if(yt&&yt.setVolume)yt.setVolume(v);if(tw)tw.setVolume(Math.max(0,Math.min(1,v/100)))}catch(e){}}
+function seekTo(t){try{if(media&&isFinite(media.duration)&&Math.abs(media.currentTime-t)>3)media.currentTime=Math.min(t,media.duration-1);if(yt&&yt.seekTo&&Math.abs(yt.getCurrentTime()-t)>3)yt.seekTo(t,true)}catch(e){}}
+addEventListener('message',e=>{
+  let d=e.data;if(typeof d==='string'){try{d=JSON.parse(d)}catch(x){return}}
+  if(!d||!d.action)return;
+  if(d.action==='volume')setVol(d.v);
+  else if(d.action==='pause'){paused=true;try{if(media)media.pause();if(yt&&yt.pauseVideo)yt.pauseVideo();if(tw)tw.pause()}catch(x){}}
+  else if(d.action==='resume'){paused=false;if(d.t!=null)seekTo(d.t);try{if(media)media.play();if(yt&&yt.playVideo)yt.playVideo();if(tw)tw.play()}catch(x){}}
+});
+
+try{
+  if(kind==='video')video(src);
+  else if(kind==='audio')audio(src);
+  else if(kind==='image')image(src);
+  else if(kind==='youtube')youtube(vid);
+  else if(kind==='twitch_channel')twitch({channel:vid});
+  else if(kind==='twitch_video')twitch({video:vid});
+  else say('Unbekannter Typ');
+}catch(e){say('Fehler: '+e.message)}
+</script></body></html>
